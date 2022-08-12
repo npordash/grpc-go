@@ -555,7 +555,7 @@ type parser struct {
 // No other error values or types must be returned, which also means
 // that the underlying io.Reader must not return an incompatible
 // error.
-func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byte, err error) {
+/*func (p *parser) recvMsg(maxLength int) (pf payloadFormat, msg []byte, err error) {
 	if _, err := p.r.Read(p.header[:]); err != nil {
 		return 0, nil, err
 	}
@@ -569,8 +569,8 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 	if int64(length) > int64(maxInt) {
 		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max length allowed on current machine (%d vs. %d)", length, maxInt)
 	}
-	if int(length) > maxReceiveMessageSize {
-		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
+	if int(length) > maxLength {
+		return 0, nil, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxLength)
 	}
 	// TODO(bradfitz,zhaoq): garbage. reuse buffer after proto decoding instead
 	// of making it for each message:
@@ -582,6 +582,97 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 		return 0, nil, err
 	}
 	return pf, msg, nil
+}*/
+
+// FIXME
+func (p *parser) recvHeader(maxLength int) (pf payloadFormat, length int, err error) {
+	if _, err := p.r.Read(p.header[:]); err != nil {
+		return 0, 0, err
+	}
+
+	pf = payloadFormat(p.header[0])
+	length = int(binary.BigEndian.Uint32(p.header[1:]))
+
+	if length == 0 {
+		return pf, 0, nil
+	}
+	if int64(length) > int64(maxInt) {
+		return 0, 0, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max length allowed on current machine (%d vs. %d)", length, maxInt)
+	}
+	if length > maxLength {
+		return 0, 0, status.Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxLength)
+	}
+	return pf, length, nil
+}
+
+// FIXME
+func (p *parser) recvMsgUncompressed(msgLength int) (msg []byte, err error) {
+	// TODO(bradfitz,zhaoq): garbage. reuse buffer after proto decoding instead
+	// of making it for each message:
+	msg = make([]byte, msgLength)
+	if _, err := p.r.Read(msg); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	return msg, nil
+}
+
+// FIXME
+func (p *parser) recvMsgWithCompressor(c encoding.Compressor, msgLength, maxLength int) (msg []byte, length int, err error) {
+	var (
+		buf *bytes.Buffer
+		dcr io.Reader
+	)
+	if sizer, ok := c.(interface {
+		DecompressedSize([]byte) int
+	}); ok {
+		msg, err := p.recvMsgUncompressed(msgLength)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// FIXME
+		dcr, err = c.Decompress(bytes.NewReader(msg))
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// FIXME
+		size := sizer.DecompressedSize(msg)
+		switch {
+		case size > maxLength:
+			return nil, size, nil
+		case size < 0:
+			size = msgLength // Fallback to the compressed length as the initial buffer size.
+		default:
+			size += bytes.MinRead // +MinRead so ReadFrom will not reallocate if size is correct.
+		}
+		buf = bytes.NewBuffer(make([]byte, 0, size))
+	} else {
+		// FIXME
+		dcr, err = c.Decompress(io.LimitReader(p.r, int64(msgLength)))
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// FIXME
+		buf = bytes.NewBuffer(make([]byte, 0, msgLength))
+	}
+
+	n, err := buf.ReadFrom(io.LimitReader(dcr, int64(maxLength)+1))
+	return buf.Bytes(), int(n), err
+}
+
+// FIXME
+func (p *parser) recvMsgWithDecompressor(dc Decompressor, msgLength, maxLength int) (msg []byte, length int, err error) {
+	msg, err = p.recvMsgUncompressed(msgLength)
+	if err != nil {
+		return nil, 0, err
+	}
+	msg, err = dc.Do(io.LimitReader(bytes.NewReader(msg), int64(maxLength)+1))
+	return msg, len(msg), err
 }
 
 // encode serializes msg and returns a buffer containing the message, or an
@@ -687,43 +778,45 @@ type payloadInfo struct {
 }
 
 func recvAndDecompress(p *parser, s *transport.Stream, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor) ([]byte, error) {
-	pf, d, err := p.recvMsg(maxReceiveMessageSize)
+	pf, msgLength, err := p.recvHeader(maxReceiveMessageSize)
 	if err != nil {
 		return nil, err
 	}
 	if payInfo != nil {
-		payInfo.wireLength = len(d)
+		payInfo.wireLength = msgLength
 	}
 
 	if st := checkRecvPayload(pf, s.RecvCompress(), compressor != nil || dc != nil); st != nil {
 		return nil, st.Err()
 	}
 
-	var size int
 	if pf == compressionMade {
+		var (
+			msg  []byte
+			size int
+		)
 		// To match legacy behavior, if the decompressor is set by WithDecompressor or RPCDecompressor,
 		// use this decompressor as the default.
 		if dc != nil {
-			d, err = dc.Do(bytes.NewReader(d))
-			size = len(d)
+			msg, size, err = p.recvMsgWithDecompressor(dc, msgLength, maxReceiveMessageSize)
 		} else {
-			d, size, err = decompress(compressor, d, maxReceiveMessageSize)
+			msg, size, err = p.recvMsgWithCompressor(compressor, msgLength, maxReceiveMessageSize)
 		}
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "grpc: failed to decompress the received message %v", err)
 		}
 		if size > maxReceiveMessageSize {
-			// TODO: Revisit the error code. Currently keep it consistent with java
-			// implementation.
+			// TODO: Revisit the error code. Currently keep it consistent with java implementation.
 			return nil, status.Errorf(codes.ResourceExhausted, "grpc: received message after decompression larger than max (%d vs. %d)", size, maxReceiveMessageSize)
 		}
+		return msg, nil
 	}
-	return d, nil
+	return p.recvMsgUncompressed(msgLength)
 }
 
 // Using compressor, decompress d, returning data and size.
 // Optionally, if data will be over maxReceiveMessageSize, just return the size.
-func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize int) ([]byte, int, error) {
+/*func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize int) ([]byte, int, error) {
 	dcReader, err := compressor.Decompress(bytes.NewReader(d))
 	if err != nil {
 		return nil, 0, err
@@ -747,7 +840,7 @@ func decompress(compressor encoding.Compressor, d []byte, maxReceiveMessageSize 
 	// reader is over limit, the result will be bigger than max.
 	d, err = ioutil.ReadAll(io.LimitReader(dcReader, int64(maxReceiveMessageSize)+1))
 	return d, len(d), err
-}
+}*/
 
 // For the two compressor parameters, both should not be set, but if they are,
 // dc takes precedence over compressor.

@@ -66,9 +66,14 @@ func (s) TestSimpleParsing(t *testing.T) {
 	} {
 		buf := fullReader{bytes.NewReader(test.p)}
 		parser := &parser{r: buf}
-		pt, b, err := parser.recvMsg(math.MaxInt32)
-		if err != test.err || !bytes.Equal(b, test.b) || pt != test.pt {
-			t.Fatalf("parser{%v}.recvMsg(_) = %v, %v, %v\nwant %v, %v, %v", test.p, pt, b, err, test.pt, test.b, test.err)
+		pt, length, err := parser.recvHeader(math.MaxInt32)
+		if err != test.err || length != len(test.b) || pt != test.pt {
+			t.Fatalf("parser{%v}.recvHeader(_) = %v, %v, %v\nwant %v, %v, %v", test.p, pt, length, err, test.pt, len(test.b), test.err)
+		}
+		var b []byte
+		b, err = parser.recvMsgUncompressed(length)
+		if err != test.err || !bytes.Equal(b, test.b) {
+			t.Fatalf("parser{%v}.recvMsgUncompressed(_) = %v, %v\nwant %v, %v", test.p, b, err, test.b, test.err)
 		}
 	}
 }
@@ -88,17 +93,24 @@ func (s) TestMultipleParsing(t *testing.T) {
 		{compressionNone, []byte("d")},
 	}
 	for i, want := range wantRecvs {
-		pt, data, err := parser.recvMsg(math.MaxInt32)
-		if err != nil || pt != want.pt || !reflect.DeepEqual(data, want.data) {
-			t.Fatalf("after %d calls, parser{%v}.recvMsg(_) = %v, %v, %v\nwant %v, %v, <nil>",
-				i, p, pt, data, err, want.pt, want.data)
+		pt, length, err := parser.recvHeader(math.MaxInt32)
+		if err != nil || pt != want.pt || length != len(want.data) {
+			t.Fatalf("after %d calls, parser{%v}.recvHeader(_) = %v, %v, %v\nwant %v, %v, <nil>",
+				i, p, pt, length, err, want.pt, len(want.data))
+		}
+
+		var data []byte
+		data, err = parser.recvMsgUncompressed(length)
+		if err != nil || !reflect.DeepEqual(data, want.data) {
+			t.Fatalf("after %d calls, parser{%v}.recvMsgUncompressed(_) = %v, %v\nwant %v, <nil>",
+				i, p, data, err, want.data)
 		}
 	}
 
-	pt, data, err := parser.recvMsg(math.MaxInt32)
+	pt, length, err := parser.recvHeader(math.MaxInt32)
 	if err != io.EOF {
-		t.Fatalf("after %d recvMsgs calls, parser{%v}.recvMsg(_) = %v, %v, %v\nwant _, _, %v",
-			len(wantRecvs), p, pt, data, err, io.EOF)
+		t.Fatalf("after %d calls, parser{%v}.recvHeader(_) = %v, %v, %v\nwant _, _, %v",
+			len(wantRecvs), p, pt, length, err, io.EOF)
 	}
 }
 
